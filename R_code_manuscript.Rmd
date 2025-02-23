@@ -1,0 +1,782 @@
+---
+title: "Manuscript_R_code_BT"
+output: html_document
+date: "2024-05-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+## PREPROCESSING
+
+### COLOURS AND LIBRARIES
+
+```{r color settings}
+
+location_colors <- c("natural_forest"="#06A77D", "peri-urban_village"="#C2EFEB", "urban_forest"="#8ED081", "urban_woodland"="#58A4B0", "urban_park"="#175676", "residential_area"="#E8C547", "office_area"="#A63446")
+
+year_colors = c("2018"="#1D8A99","2019"="#A5CC6B")
+
+```
+
+```{r libraries}
+
+library(corncob)
+library(ggplot2)
+library(vegan)
+library(dplyr)
+library(scales)
+library(grid)
+library(reshape2)
+library(phyloseq)
+library(biomformat)
+library(microbiome)
+library(DESeq2)
+library(dunn.test)
+library(rstatix)
+library(ggpubr)
+library(metagenomeSeq)
+library(ape)
+library(rfm)
+library(picante)
+library(dbplyr)
+library(geosphere)
+library(readxl)
+library(decontam)
+library(lme4)
+library(sjPlot)
+
+```
+
+### PHYLOSEQ OBJECT
+
+```{r phyloseq object}
+
+# tree
+
+tree <- read.tree("tree.nwk")
+
+# ASV (just called OTU) and TAX tables
+
+otu_table <- read_excel("otu_excel.xlsx")
+tax_table <- read_excel("taxonomy_excel.xlsx")
+
+otu_table <- otu_table %>%
+    tibble::column_to_rownames("Feature_ID") 
+
+tax_table <- tax_table %>% 
+    tibble::column_to_rownames("Feature_ID")
+
+# metadata
+
+meta_data  <- data.table::fread("metadata_BT_CSV.csv")
+
+meta_data <- meta_data %>% 
+    tibble::column_to_rownames("dna_code")
+
+meta_boxes <- meta_data %>% 
+  filter(nestbox_dataset == "yes")
+
+meta_boxes <- tibble::rownames_to_column(meta_boxes, "sample_id")
+
+
+# transforming the datasets
+
+otu_mat <- as.matrix(otu_table)
+
+otu_numeric <- apply(otu_mat, 2, as.numeric)
+rownames(otu_numeric) <- rownames(otu_mat)
+
+
+# fixing the taxonomy table, so there are no NAs
+
+tax_mat <- as.data.frame(tax_table)
+tax_mat$Species <- ifelse(is.na(tax_mat$Species), paste(tax_mat$Genus, "unclassified"), tax_mat$Species)
+
+# all described on the finest possible level, Species should not be analysed anyways
+
+tax_mat <- as.matrix(tax_mat)
+
+###
+
+OTU = otu_table(otu_numeric, taxa_are_rows = TRUE)
+TAX = tax_table(tax_mat)
+samples = sample_data(meta_data)
+
+```
+
+### DECONTAMINATION AND FILTERING
+
+```{r decontamination}
+
+ps <- phyloseq(OTU, TAX, samples, tree, package="decontam")
+
+# Thermus removed manually as suggested by the package creator, due to low number of control samples
+
+ps_thermus <- ps %>%
+  subset_taxa(Genus != "Thermus")
+
+ps_frame <- as.data.frame(sample_data(ps_thermus))
+ps_frame$total_reads <- sample_sums(ps_thermus)
+ps_frame <- ps_frame[order(ps_frame$total_reads),]
+ps_frame$Index <- seq(nrow(ps_frame))
+
+ggplot(data=ps_frame, aes(x=Index, y=total_reads, color=Sample_or_Control)) + geom_point()
+
+# it's visible that the controls are one of the samples with the smallest number of reads, the way it should be
+
+contamdf.freq <- isContaminant(ps_thermus, method="frequency", conc="dna_concentration")
+head(contamdf.freq)
+table(contamdf.freq$contaminant)
+which(contamdf.freq$contaminant)
+
+# 33 contaminant ASVs detected, their frequency:
+
+set.seed(100)
+plot_frequency(ps_thermus, taxa_names(ps_thermus)[sample(which(contamdf.freq$contaminant),3)], conc="dna_concentration") +
+    xlab("DNA Concentration")
+
+# now, creating a database without contaminants:
+
+ps.noncontam <- prune_taxa(!contamdf.freq$contaminant, ps_thermus)
+ps.noncontam
+
+sample_data(ps.noncontam)$is.neg <- sample_data(ps.noncontam)$Sample_or_Control == "Control Sample"
+contamdf.prev <- isContaminant(ps.noncontam, method="prevalence", neg="is.neg")
+table(contamdf.prev$contaminant)
+
+# prevalence based decontamination also run, but did not detect anything
+
+otu_after <- as.matrix(otu_table(ps.noncontam))
+
+```
+
+```{r filtering}
+
+# filtering out the NAs, mitochonria and chloroplasts
+
+data.1 <- ps.noncontam %>%
+  subset_taxa(
+    ((Family != "Mitochondria") &
+       (Order != "Chloroplast") &
+       (Phylum !="Phylum_unclassified") &
+       (Phylum != "unknown_unclassified"))
+  )
+
+# didn't filter out the rare taxa, because it's ASVs: the singletons are supposed to be filtered out already on the Qiime level
+
+# repeated decontamination
+
+contamdf.freq2 <- isContaminant(data.1, method="frequency", conc="dna_concentration")
+head(contamdf.freq2)
+
+table(contamdf.freq2$contaminant)
+
+# 7 more detected
+
+ps.noncontam2 <- prune_taxa(!contamdf.freq2$contaminant, data.1)
+ps.noncontam2
+
+# final filtered dataset:
+
+data.use <- subset_samples(ps.noncontam2, filtered_dataset =="yes") 
+
+```
+
+Saving the matrices as csv files:
+
+```{r taxa tables as csv}
+
+OTUmatrix = as(otu_table(data.use),"matrix") 
+OTUdf = as.data.frame(OTUmatrix)
+#write.csv(OTUdf, "OTUtable.csv")
+
+taxamatrix = as(tax_table(data.use),"matrix") 
+taxadf = as.data.frame(taxamatrix)
+#write.csv(taxadf, "TAXAtable.csv")
+
+```
+
+### SUBSETTING
+
+```{r subsets}
+
+#only nextboxes
+nestbox_dataset <- subset_samples(data.use, nestbox_dataset =="yes") 
+
+#only urban forest, two types of cavities
+cavity_dataset <- subset_samples(data.use, cavity_dataset =="yes") 
+
+#separate subsets for years 2018 and 2019
+nestbox_2018 <- subset_samples(nestbox_dataset, year =="2018") 
+nestbox_2019 <- subset_samples(nestbox_dataset, year =="2019") 
+
+```
+
+```{r nestboxes taxa tables as csv}
+
+OTUmatrix_box = as(otu_table(nestbox_dataset),"matrix") 
+OTUdf_box = as.data.frame(OTUmatrix_box)
+#write.csv(OTUdf_box, "OTUtable_boxes.csv")
+
+taxamatrix_box = as(tax_table(nestbox_dataset),"matrix") 
+taxadf_box = as.data.frame(taxamatrix_box)
+#write.csv(taxadf_box, "TAXAtable_boxes.csv")
+
+```
+
+### RAREFACTION
+
+```{r rarefaction of the datasets}
+
+set.seed(10)
+rarefy.data.use <- rarefy_even_depth(data.use,rngseed=1,sample.size=min(sample_sums(data.use)), replace=F)
+
+rarefy.nestbox_dataset <- rarefy_even_depth(nestbox_dataset,rngseed=1,sample.size=min(sample_sums(nestbox_dataset)), replace=F)
+
+rarefy.cavity_dataset <- rarefy_even_depth(cavity_dataset,rngseed=1,sample.size=min(sample_sums(cavity_dataset)), replace=F)
+
+rarefy.2018 <- rarefy_even_depth(nestbox_2018,rngseed=1,sample.size=min(sample_sums(nestbox_2018)), replace=F)
+rarefy.2019 <- rarefy_even_depth(nestbox_2019,rngseed=1,sample.size=min(sample_sums(nestbox_2019)), replace=F)
+
+```
+
+### NORMALISATION
+
+```{r metagenomeSeq sorcery}
+
+metagenome.obj <- phyloseq_to_metagenomeSeq(data.use)
+cNstat <- metagenomeSeq::cumNormStatFast(metagenome.obj)
+metagenome.obj <- metagenomeSeq::cumNorm(metagenome.obj, p = cNstat)
+
+metag.norm.counts <- metagenomeSeq::MRcounts(metagenome.obj, norm = TRUE)
+
+metag.norm.counts_log <- log(metag.norm.counts+0.0001)
+metag.norm.counts_log2 <- metag.norm.counts_log-(log(0.0001))
+
+otu_normMG.obj <- otu_table(metag.norm.counts_log2, taxa_are_rows = TRUE)
+phylo_normMG.obj <- phyloseq(otu_normMG.obj, data.use@tax_table, data.use@sam_data)
+
+data.use.css <- merge_phyloseq(phylo_normMG.obj, data.use@phy_tree)
+
+OTUmatrix = as(otu_table(data.use.css),"matrix") 
+OTUdf = as.data.frame(OTUmatrix)
+#write.csv(OTUdf, "OTU_filteredData_css_transformed.csv")
+
+rm(metagenome.obj,metag.norm.counts,metag.norm.counts_log,metag.norm.counts_log2,otu_normMG.obj,phylo_normMG.obj)
+
+```
+
+```{r metagenome nestboxes only}
+
+box_metagenome.obj <- phyloseq_to_metagenomeSeq(nestbox_dataset)
+box_cNstat <- metagenomeSeq::cumNormStatFast(box_metagenome.obj)
+box_metagenome.obj <- metagenomeSeq::cumNorm(box_metagenome.obj, p = box_cNstat)
+
+box_metag.norm.counts <- metagenomeSeq::MRcounts(box_metagenome.obj, norm = TRUE)
+
+box_metag.norm.counts_log <- log(box_metag.norm.counts+0.0001)
+box_metag.norm.counts_log2 <- box_metag.norm.counts_log-(log(0.0001))
+
+box_otu_normMG.obj <- otu_table(box_metag.norm.counts_log2, taxa_are_rows = TRUE)
+box_phylo_normMG.obj <- phyloseq(box_otu_normMG.obj, nestbox_dataset@tax_table, nestbox_dataset@sam_data)
+
+data.nestbox.css <- merge_phyloseq(box_phylo_normMG.obj, nestbox_dataset@phy_tree)
+
+box_OTUmatrix =as(otu_table(data.nestbox.css),"matrix") 
+box_OTUdf = as.data.frame(box_OTUmatrix)
+#write.csv(box_OTUdf, "OTU_filtered_NESTBOXES_css_transformed.csv")
+
+rm(box_metagenome.obj,box_metag.norm.counts,box_metag.norm.counts_log,box_metag.norm.counts_log2,box_otu_normMG.obj,box_phylo_normMG.obj)
+
+```
+
+```{r normalised 2018}
+
+metagenome_2018.obj <- phyloseq_to_metagenomeSeq(nestbox_2018)
+cNstat_2018 <- metagenomeSeq::cumNormStatFast(metagenome_2018.obj)
+metagenome_2018.obj <- metagenomeSeq::cumNorm(metagenome_2018.obj, p = cNstat_2018)
+
+metag.norm.counts_2018 <- metagenomeSeq::MRcounts(metagenome_2018.obj, norm = TRUE)
+
+metag.norm.counts_log_2018 <- log(metag.norm.counts_2018+0.0001)
+metag.norm.counts_log2_2018 <- metag.norm.counts_log_2018-(log(0.0001))
+
+otu_normMG.obj_2018 <- otu_table(metag.norm.counts_log2_2018, taxa_are_rows = TRUE)
+phylo_normMG_2018.obj <- phyloseq(otu_normMG.obj_2018, nestbox_2018@tax_table, nestbox_2018@sam_data)
+
+###
+
+data.2018.css <- merge_phyloseq(phylo_normMG_2018.obj, nestbox_2018@phy_tree)
+
+#box_OTUmatrix =as(otu_table(data.nestbox.css),"matrix") 
+#box_OTUdf = as.data.frame(box_OTUmatrix)
+#write.csv(box_OTUdf, "OTU_filtered_NESTBOXES_css_transformed.csv")
+
+#rm(box_metagenome.obj,box_metag.norm.counts,box_metag.norm.counts_log,box_metag.norm.counts_log2,box_otu_normMG.obj,box_phylo_normMG.obj)
+
+```
+
+```{r normalised 2019}
+
+metagenome_2019.obj <- phyloseq_to_metagenomeSeq(nestbox_2019)
+cNstat_2019 <- metagenomeSeq::cumNormStatFast(metagenome_2019.obj)
+metagenome_2019.obj <- metagenomeSeq::cumNorm(metagenome_2019.obj, p = cNstat_2019)
+
+metag.norm.counts_2019 <- metagenomeSeq::MRcounts(metagenome_2019.obj, norm = TRUE)
+
+metag.norm.counts_log_2019 <- log(metag.norm.counts_2019+0.0001)
+metag.norm.counts_log2_2019 <- metag.norm.counts_log_2019-(log(0.0001))
+
+otu_normMG.obj_2019 <- otu_table(metag.norm.counts_log2_2019, taxa_are_rows = TRUE)
+phylo_normMG_2019.obj <- phyloseq(otu_normMG.obj_2019, nestbox_2019@tax_table, nestbox_2019@sam_data)
+
+###
+
+data.2019.css <- merge_phyloseq(phylo_normMG_2019.obj, nestbox_2019@phy_tree)
+
+```
+
+## ALPHA DIVERSITY
+
+### RAREFACTION
+
+initial calculations on both rarefied and unrarefied data + correlations to compare, later on it's only rarefied
+
+```{r calculation of alpha diversity unrarefied data}
+
+alpha.diver.unrare <- estimate_richness(data.use, 
+                                          measures = c("Shannon","Chao1","Observed"))
+
+phy_df <- psmelt(data.use)
+meta_phy <-meta(data.use)
+meta_phy$sam_name <- rownames(meta_phy)
+
+pd_otu <- as.data.frame(data.use@otu_table)
+pd_tree <- data.use@phy_tree
+
+# check if the tree is rooted or not
+data.use@phy_tree
+#pd_tree=multi2di(pd_tree)
+
+df.pd <- pd(t(pd_otu),pd_tree,include.root=T)
+meta_phy$Phylogenetic_Diversity <- df.pd$PD
+
+alpha.diver.unrare.all <- cbind(sample_data(data.use), alpha.diver.unrare, df.pd)
+
+```
+
+```{r calculation of alpha diver rarefied data}
+
+alpha.diver.rare <- estimate_richness(rarefy.data.use, 
+                                          measures = c("Shannon","Chao1","Observed"))
+
+rare_phy_df <- psmelt(rarefy.data.use)
+rare_meta_phy <- meta(rarefy.data.use)
+rare_meta_phy$sam_name <- rownames(rarefy.data.use)
+
+rare_pd_otu <- as.data.frame(rarefy.data.use@otu_table)
+rare_pd_tree <- rarefy.data.use@phy_tree
+
+# check if the tree is rooted or not
+rarefy.data.use@phy_tree
+#pd_tree=multi2di(pd_tree)
+
+rare_df.pd <- pd(t(rare_pd_otu),rare_pd_tree,include.root=T)
+rare_meta_phy$Phylogenetic_Diversity <- rare_df.pd$PD
+
+alpha.diver.rare.all <- cbind(sample_data(rarefy.data.use), alpha.diver.rare,rare_df.pd)
+
+```
+
+```{r normality of distribution}
+
+shapiro.test(sqrt(alpha.diver.unrare.all$Shannon)) 
+shapiro.test(log(alpha.diver.unrare.all$Chao1))
+shapiro.test(log(alpha.diver.unrare.all$PD))
+shapiro.test(log(alpha.diver.unrare.all$Observed))
+
+```
+
+```{r correlation rarefied and unrarefied data}
+
+cor.test_pd <- cor.test(alpha.diver.unrare.all$PD, alpha.diver.rare.all$PD, method=c("pearson"))
+cor.test_chao1 <- cor.test(alpha.diver.unrare.all$Chao1,alpha.diver.rare.all$Chao1, method=c("pearson"))
+cor.test_Shannon <- cor.test(alpha.diver.unrare.all$Shannon,alpha.diver.rare.all$Shannon, method=c("pearson"))
+cor.test_Observed <- cor.test(alpha.diver.unrare.all$Observed,alpha.diver.rare.all$Observed, method=c("pearson"))
+
+cor.test_pd
+cor.test_chao1
+cor.test_Shannon
+cor.test_Observed
+
+```
+
+```{r year subsets}
+
+alpha.diver.rare.cavity <- subset(alpha.diver.rare.all, cavity_dataset=="yes")
+alpha.diver.rare.nestbox <- subset(alpha.diver.rare.all, nestbox_dataset=="yes")
+#alpha.diver.2018 <- subset(alpha.diver.rare.nestbox, year=="2018")
+#alpha.diver.2019 <- subset(alpha.diver.rare.nestbox, year=="2019")
+
+
+#alpha.diver.unrare.cavity <- subset(alpha.diver.unrare.all, cavity_dataset=="yes")
+#alpha.diver.unrare.nestbox <- subset(alpha.diver.unrare.all, nestbox_dataset=="yes")
+
+```
+
+### EXPLORATION PLOTS
+
+Initial data exploration showed completely different trends in 2018 and 2019
+
+```{r exploration plots}
+
+alpha.diver.rare.nestbox$year <- as.factor(alpha.diver.rare.nestbox$year)
+
+ISA_continuous_PD <- ggplot(alpha.diver.rare.nestbox, aes(x=ISA, y=log(PD), color=year)) +
+  geom_point(size=5) +
+  theme_bw() +
+  geom_smooth(method="lm", se=TRUE, fullrange=FALSE) +
+  xlab("ISA %") + ylab("log(Faith's PD)") +
+  scale_color_manual(values = year_colors)
+
+
+ISA_continuous_PD
+
+#ggsave("ISA_continuous_PD.pdf", ISA_continuous_PD, width=350,height = 200, units ="mm",dpi=300)
+
+year_comparison <- ggplot(alpha.diver.rare.nestbox, aes(x=year, y=log(PD), color=year)) +
+  geom_boxplot() +
+  theme_bw() +
+  geom_smooth(method="lm", se=TRUE, fullrange=FALSE) +
+  xlab("year") + ylab("log(Faith's PD)") +
+  scale_color_manual(values = year_colors)
+
+year_comparison
+
+```
+
+### ALPHA MODELS
+
+```{r alpha diversity models}
+
+#basic ASV count index was not used in the final analysis
+model_ASV <- lmer(log(Observed) ~ year*ISA + d15_standardised + fledged + (1|site),
+                 data = alpha.diver.rare.nestbox)
+
+tab_model(model_ASV)
+
+##Faith's PD
+
+model_PD <- lmer(log(PD) ~ year*ISA + d15_standardised + fledged + (1|site),
+                 data = alpha.diver.rare.nestbox)
+
+tab_model(model_PD)
+
+##Chao1 diversity
+
+model_Chao1 <- lmer(log(Chao1) ~ year*ISA + d15_standardised + fledged + (1|site),
+                 data = alpha.diver.rare.nestbox)
+
+tab_model(model_Chao1)
+
+##Shannon diversity: no significances in the nestbox dataset
+
+model_Shannon <- lmer(sqrt(Shannon) ~ year*ISA + d15_standardised + fledged + (1|site),
+                 data = alpha.diver.rare.nestbox)
+
+tab_model(model_Shannon)
+
+#since the interaction was not significant, it was removed from the final Shannon model
+
+model_Shannon_no_int <- lmer(sqrt(Shannon) ~ year + ISA + d15_standardised + fledged + (1|site),
+                 data = alpha.diver.rare.nestbox)
+
+tab_model(model_Shannon_no_int)
+
+
+```
+
+## CAVITIES
+
+### ALPHA DIVERSITY
+
+```{r alpha diversity cavities}
+
+alpha.diver.rare.cavity$nest_type <- as.factor(alpha.diver.rare.cavity$nest_type)
+alpha.diver.rare.cavity$nest_type <- relevel(alpha.diver.rare.cavity$nest_type, ref = "NAT")
+
+alpha.diver.rare.cavity$year_factor <- as.factor(alpha.diver.rare.cavity$year)
+
+shapiro.test(alpha.diver.rare.cavity$Shannon)#0.232
+shapiro.test(log(alpha.diver.rare.cavity$Chao1))#0.317
+shapiro.test(log(alpha.diver.rare.cavity$PD))#0.350
+
+model_cavity <- lm(Shannon ~ year_factor*nest_type,
+                 data = alpha.diver.rare.cavity)
+
+tab_model(model_cavity)
+
+shapiro.test(resid(model_cavity))
+
+```
+
+```{r cavities plot}
+
+alpha.diver.rare.cavity$year_nest_type <- interaction(alpha.diver.rare.cavity$year, alpha.diver.rare.cavity$nest_type)
+alpha.diver.rare.cavity$year_nest_type <- factor(alpha.diver.rare.cavity$year_nest_type, 
+                                                 levels = c("2018.BOX", "2018.NAT", "2019.BOX", "2019.NAT"))
+
+cavities_by_year <- ggplot(alpha.diver.rare.cavity, aes(x=year_nest_type, y=Shannon, fill=nest_type)) +
+    geom_boxplot() +
+    labs(x="Year and Nest Type", y="Shannon Diversity", title="Shannon Diversity by Year and Nest Type") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    geom_point(size=5, alpha=0.5)
+
+cavities_by_year
+
+```
+
+### POSTHOC TESTS
+
+```{r post hoc tests}
+library(emmeans)
+
+model_shannon_cavity <- lm(Shannon ~ nest_type * year_factor, data = alpha.diver.rare.cavity)
+model_faiths_pd_cavity <- lm(log(PD) ~ nest_type * year_factor, data = alpha.diver.rare.cavity)
+
+emmeans_shannon <- emmeans(model_shannon_cavity, ~ nest_type * year_factor)
+pairwise_shannon <- pairs(emmeans_shannon)
+
+emmeans_faiths_pd <- emmeans(model_faiths_pd_cavity, ~ nest_type * year_factor)
+pairwise_faiths_pd <- pairs(emmeans_faiths_pd)
+
+summary(pairwise_shannon)
+summary(pairwise_faiths_pd)
+```
+
+## ADDITIONAL
+
+### SPATIAL AUTOCORRELATION
+
+```{r  spatial autocorrelation}
+
+library(geoR)
+library(DHARMa)
+
+ggplot(alpha.diver.rare.nestbox, aes(x = longitude, y = latitude, size = PD)) +
+  geom_point() +
+  scale_size_continuous(range = c(1,10))
+
+spatial_autocor <- read.csv("spatial_autocor_nestbox.csv", sep=";")
+
+spatial_autocor$residObservedUrban <- resid(model_ASV)
+spatial_autocor$residChaoUrban <- resid(model_Chao1)
+spatial_autocor$residPDUrban <- resid(model_PD)
+
+##
+
+sims_ASV <- simulateResiduals(model_ASV)
+sims_ASV
+
+testSpatialAutocorrelation(sims_ASV, x =  spatial_autocor$longitude, y = spatial_autocor$latitude)
+
+
+sims_PD <- simulateResiduals(model_PD)
+sims_PD
+
+testSpatialAutocorrelation(sims_PD, x =  spatial_autocor$longitude, y = spatial_autocor$latitude)
+
+sims_Chao1 <- simulateResiduals(model_Chao1)
+sims_ASV
+
+testSpatialAutocorrelation(sims_Chao1, x =  spatial_autocor$longitude, y = spatial_autocor$latitude)
+
+
+# Based on the above we don't need to switch to spatial models since the spatial pattern that we see are not significantly effect our linear model
+```
+
+### BETA prep
+
+the rest of analysis done in primer-e (permanova)
+
+```{r prepare the table for bray curtis and jaccard}
+
+otus.css <-as(otu_table(data.nestbox.css),"matrix") 
+otus.css <-t(otus.css)
+otus.css <-as.data.frame(otus.css)
+
+otus.css_2018 <-as(otu_table(data.2018.css),"matrix") 
+otus.css_2018 <-t(otus.css_2018)
+otus.css_2018 <-as.data.frame(otus.css_2018)
+
+otus.css_2019 <-as(otu_table(data.2019.css),"matrix") 
+otus.css_2019 <-t(otus.css_2019)
+otus.css_2019 <-as.data.frame(otus.css_2019)
+
+```
+
+```{r run Bray curtis}
+
+dist.bray.nestbox= vegdist(otus.css, method = "bray")
+
+# convert it to matrix and save as csv file for further usage outside R
+dist.bray.nestbox.matrix <- as.matrix(dist.bray.nestbox)
+#write.csv(dist.bray.nestbox.matrix,"BrayCurtis_nestbox_dataset.csv")
+
+
+dist.bray.nestbox_2018= vegdist(otus.css_2018, method = "bray")
+dist.bray.nestbox.matrix_2018 <- as.matrix(dist.bray.nestbox_2018)
+#write.csv(dist.bray.nestbox.matrix_2018,"BrayCurtis_nestbox_dataset_2018.csv")
+
+dist.bray.nestbox_2019= vegdist(otus.css_2019, method = "bray")
+dist.bray.nestbox.matrix_2019 <- as.matrix(dist.bray.nestbox_2019)
+#write.csv(dist.bray.nestbox.matrix_2019,"BrayCurtis_nestbox_dataset_2019.csv")
+
+```
+
+```{r run Jaccard}
+
+dist.jaccard.nestbox = vegdist(otus.css, method = "jaccard", binary=TRUE)
+
+# convert it to matrix and save as csv file for furteher usage outside R
+dist.jaccard.nestbox.matrix <- as.matrix(dist.jaccard.nestbox)
+#write.csv(dist.jaccard.nestbox.matrix,"Jaccard_nestbox_dataset.csv")
+
+dist.jaccard.nestbox_2018 = vegdist(otus.css_2018, method = "jaccard", binary=TRUE)
+dist.jaccard.nestbox.matrix_2018 <- as.matrix(dist.jaccard.nestbox_2018)
+#write.csv(dist.jaccard.nestbox.matrix_2018,"Jaccard_nestbox_dataset_2018.csv")
+
+dist.jaccard.nestbox_2019 = vegdist(otus.css_2019, method = "jaccard", binary=TRUE)
+dist.jaccard.nestbox.matrix_2019 <- as.matrix(dist.jaccard.nestbox_2019)
+#write.csv(dist.jaccard.nestbox.matrix_2019,"Jaccard_nestbox_dataset_2019.csv")
+
+```
+
+```{r weighted Unifrac}
+
+dist.Wunifrac.nestbox <- UniFrac(data.nestbox.css, 
+                        weighted = TRUE, 
+                        normalized = TRUE,  
+                        parallel = FALSE, 
+                        fast = TRUE)
+
+
+dist.Wunifrac.nestbox.matrix <- as.matrix(dist.Wunifrac.nestbox)
+#write.csv(dist.Wunifrac.nestbox.matrix,"WeightedUnifrac_nestbox.csv")
+
+dist.Wunifrac.nestbox_2018 <- UniFrac(data.2018.css, 
+                        weighted = TRUE, 
+                        normalized = TRUE,  
+                        parallel = FALSE, 
+                        fast = TRUE)
+dist.Wunifrac.nestbox.matrix_2018 <- as.matrix(dist.Wunifrac.nestbox_2018)
+#write.csv(dist.Wunifrac.nestbox.matrix_2018,"WeightedUnifrac_nestbox_2018.csv")
+
+dist.Wunifrac.nestbox_2019 <- UniFrac(data.2019.css, 
+                        weighted = TRUE, 
+                        normalized = TRUE,  
+                        parallel = FALSE, 
+                        fast = TRUE)
+
+dist.Wunifrac.nestbox.matrix_2019 <- as.matrix(dist.Wunifrac.nestbox_2019)
+#write.csv(dist.Wunifrac.nestbox.matrix_2019,"WeightedUnifrac_nestbox_2019.csv")
+
+```
+
+```{r unweighted Unifrac}
+
+dist.UNunifrac.nestbox <- UniFrac(data.nestbox.css, 
+                                        weighted = FALSE, 
+                                        normalized = TRUE,  
+                                        parallel = FALSE, 
+                                        fast = TRUE)
+
+dist.UNunifrac.nestbox.matrix <- as.matrix(dist.UNunifrac.nestbox)
+#write.csv(dist.UNunifrac.nestbox.matrix,"UnweighteddUnifrac_nestbox.csv")
+
+dist.UNunifrac.nestbox_2018 <- UniFrac(data.2018.css, 
+                                        weighted = FALSE, 
+                                        normalized = TRUE,  
+                                        parallel = FALSE, 
+                                        fast = TRUE)
+
+dist.UNunifrac.nestbox.matrix_2018 <- as.matrix(dist.UNunifrac.nestbox_2018)
+#write.csv(dist.UNunifrac.nestbox.matrix_2018,"UnweighteddUnifrac_nestbox_2018.csv")
+
+dist.UNunifrac.nestbox_2019 <- UniFrac(data.2019.css, 
+                                        weighted = FALSE, 
+                                        normalized = TRUE,  
+                                        parallel = FALSE, 
+                                        fast = TRUE)
+
+dist.UNunifrac.nestbox.matrix_2019 <- as.matrix(dist.UNunifrac.nestbox_2019)
+#write.csv(dist.UNunifrac.nestbox.matrix_2019,"UnweighteddUnifrac_nestbox_2019.csv")
+
+```
+
+Unifrac year plot used in the paper:
+
+```{r unifrac year plot}
+
+data.nestbox.css@sam_data$year <- as.factor(data.nestbox.css@sam_data$year)
+
+year_unifrac <- plot_ordination(
+  physeq = data.nestbox.css,
+  ordination = unifrac_pcoa_nestbox,
+  color = "year",
+  title = "") + 
+  geom_point (size=10)+
+  scale_color_manual(values = c("2018"="#1D8A99","2019"="#A5CC6B"))+
+  theme_bw() +
+  stat_ellipse(type = "t", linetype = 2)
+
+year_unifrac
+
+```
+
+### COMPOSITIONAL ANALYSIS 2018/19
+
+```{r composition}
+
+comparison_year <- nestbox_dataset %>%
+  phyloseq::subset_samples(year %in% c("2018","2019")) %>%
+  tax_glom("Family")
+
+results_comparsion_year <-differentialTest(formula = ~ year,
+                                     phi.formula = ~ year,
+                                     formula_null = ~ 1,
+                                     phi.formula_null = ~ year,
+                                     test = "Wald", boot = FALSE,
+                                     data = comparison_year,
+                                     fdr_cutoff = 0.05)
+
+year_differential <- plot(results_comparsion_year, level = c("Family"))
+
+year_differential
+
+otuCorn <-otu_to_taxonomy(OTU = results_comparsion_year$significant_taxa, data = comparison_year)
+otuCorn<- as.data.frame(otuCorn)
+otuCorn<-tibble::rownames_to_column(otuCorn,"OTU.x")
+
+pCorncob <-as.data.frame(results_comparsion_year$p,rownames=NULL)
+pCorncob<-tibble::rownames_to_column(pCorncob,"OTUp")
+colnames(pCorncob)[2]<- c("p")
+
+padjCorncob <-as.data.frame(results_comparsion_year$p_fdr,rownames=NULL)
+padjCorncob<-tibble::rownames_to_column(padjCorncob,"OTUpadj")
+colnames(padjCorncob)[2]<- c("padj")
+
+stats_comparison <-merge(pCorncob,otuCorn, by.x="OTUp",by.y="OTU.x")
+stats_comparison <-merge(padjCorncob,stats_comparison, by.x="OTUpadj",by.y="OTUp")
+stats_comparison[order(stats_comparison[,2], decreasing = F), ]
+
+#write.csv(stats_comparison_2,"all_stats_comparison_2.csv")
+
+```
+
+
+
+![](im-done-woo.jpg)
